@@ -38,6 +38,9 @@ The human's input visibly changes what the AI produces, and the lineage shows wh
 
 ## 2. Try it (free — stub agents, no API key)
 
+Start the stack with `docker compose up -d --build` (the `--build` matters: without it
+Docker reuses an older image that may not contain the orchestration endpoints).
+
 ```bash
 # 1. start a vague run → stops for a human
 curl -s -X POST localhost:8080/api/v1/runs -H 'Content-Type: application/json' \
@@ -56,6 +59,86 @@ curl -s localhost:8080/api/v1/runs/<id>
 curl -s -X POST localhost:8080/api/v1/runs -H 'Content-Type: application/json' \
      -d '{"requirement":"Add an endpoint that returns total clicks"}'
 ```
+
+### Example output (real run, stub agents; ids and timestamps shortened)
+
+**1. Start** — `POST /api/v1/runs` → `201 Created`, `Location: /api/v1/runs/07d96913-…`
+
+```json
+{
+  "id": "07d96913-…",
+  "rawRequirement": "Make the system more scalable",
+  "status": "AWAITING_HUMAN",
+  "tasks": [{
+    "taskType": "REQUIREMENTS", "status": "AWAITING_HUMAN", "attempts": 1,
+    "output": {
+      "intent": "Improve the URL shortener's ability to handle more traffic",
+      "functionalRequirements": [
+        "Cache redirect lookups so most requests skip the database",
+        "Keep p99 redirect latency under 50 ms at peak load"
+      ],
+      "ambiguities": [
+        { "question": "What peak load must the system handle?",
+          "proposedDefault": "1,000 redirects per second", "impact": "HIGH" },
+        { "question": "How long may cached redirects be stale?",
+          "proposedDefault": "60 seconds", "impact": "LOW" }
+      ]
+    }
+  }],
+  "decisions": []
+}
+```
+
+The HIGH ambiguity stops the run; the LOW one is settled by its proposed default.
+
+**2. Approve** — `POST /api/v1/runs/07d96913-…/approve` with
+`{"approvedBy":"kazi","decision":"Plan for 5,000 redirects per second"}`
+
+```json
+{
+  "id": "07d96913-…",
+  "status": "COMPLETED",
+  "tasks": [
+    { "taskType": "REQUIREMENTS", "status": "COMPLETED", "attempts": 1, "output": { "…": "unchanged" } },
+    { "taskType": "DESIGN", "status": "COMPLETED", "attempts": 1,
+      "output": {
+        "approach": "Cache short-code lookups in Redis to serve 5,000 redirects/sec",
+        "tasks": [
+          { "id": "T1", "title": "Add Redis cache for short-code lookups",   "dependsOn": [] },
+          { "id": "T2", "title": "Invalidate cache on URL update or expiry", "dependsOn": ["T1"] },
+          { "id": "T3", "title": "Add load test for 5,000 redirects/sec",    "dependsOn": ["T1"] },
+          { "id": "T4", "title": "Document capacity and cache TTL decision", "dependsOn": ["T2", "T3"] }
+        ]
+      } }
+  ],
+  "decisions": [
+    { "question": "What peak load must the system handle?",
+      "decision": "Plan for 5,000 redirects per second",
+      "decidedBy": "kazi", "decidedAt": "2026-11-21T05:37:33" }
+  ]
+}
+```
+
+The design plan is built from the human's answer: Redis caching and a load test at
+5,000/sec. Without that answer the same request would have stopped; a request that
+needs no answer gets the simple plan instead.
+
+**3. Audit trail** (from `GET /api/v1/runs/07d96913-…`, the same after a restart)
+
+| Time | Scope | From → To | Reason |
+|---|---|---|---|
+| 05:33:41.110 | RUN | — → RUNNING | run created |
+| 05:33:41.145 | REQUIREMENTS | PENDING → RUNNING | requirements analysis started |
+| 05:33:41.198 | REQUIREMENTS | RUNNING → AWAITING_HUMAN | HIGH impact ambiguity: What peak load must the system handle? |
+| 05:33:41.201 | RUN | RUNNING → AWAITING_HUMAN | waiting for a person to resolve the ambiguity |
+| 05:37:33.555 | REQUIREMENTS | AWAITING_HUMAN → COMPLETED | approved by kazi: Plan for 5,000 redirects per second |
+| 05:37:33.556 | RUN | AWAITING_HUMAN → RUNNING | resumed after human approval |
+| 05:37:33.572 | DESIGN | PENDING → RUNNING | design started with 1 human decision(s) |
+| 05:37:33.583 | DESIGN | RUNNING → COMPLETED | plan validated: 4 tasks |
+| 05:37:33.584 | RUN | RUNNING → COMPLETED | all stages completed |
+
+The four-minute gap between 05:33 and 05:37 is the run waiting for a person, with nothing
+held in memory.
 
 A second `approve`, or approving a run that is not waiting, returns **409 Conflict**.
 

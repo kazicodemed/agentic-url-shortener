@@ -27,7 +27,8 @@ A production-grade URL shortener service with an **agentic SDLC orchestration la
 
 ```bash
 # Start all services (PostgreSQL, Redis, App)
-docker-compose up -d
+# --build makes sure the app image contains the current code
+docker-compose up -d --build
 
 # View logs
 docker-compose logs -f
