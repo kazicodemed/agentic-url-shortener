@@ -33,7 +33,6 @@ public final class DagScheduler {
         List<String> ready = new ArrayList<>();
 
         // first wave: tasks that depend on nothing
-        // (a for loop, not forEach: `ready` is reassigned below, so a lambda can't use it)
         for (Map.Entry<String, Integer> entry : remainingDependencies.entrySet()) {
             if (entry.getValue() == 0) {
                 ready.add(entry.getKey());
