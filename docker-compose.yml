@@ -1,0 +1,79 @@
+# Full local stack: Spring Boot app + PostgreSQL + Redis.
+#   docker compose up -d --build           # core services
+#   docker compose --profile tools up -d   # + pgAdmin and Redis Commander
+# Secrets come from .env (see .env.example); the defaults below are for local dev only.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: urlshortener
+      POSTGRES_USER: urlshortener
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-urlshortener_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U urlshortener -d urlshortener"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-redis_password}"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_password}
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker            # loads application-docker.yml
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-urlshortener_password}
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_password}
+      URL_SHORTENER_BASE_URL: ${URL_SHORTENER_BASE_URL:-http://localhost:8080}
+      ORCHESTRATION_AGENTS_MODE: ${ORCHESTRATION_AGENTS_MODE:-stub}   # stub (free) or claude
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}                      # only needed for claude mode
+    ports:
+      - "8080:8080"
+
+  # ---- optional tools: docker compose --profile tools up -d ----
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    profiles: ["tools"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@urlshortener.com
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    profiles: ["tools"]
+    environment:
+      REDIS_HOSTS: local:redis:6379:0:${REDIS_PASSWORD:-redis_password}
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+
+volumes:
+  postgres-data:
+  redis-data:

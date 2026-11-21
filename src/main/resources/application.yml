@@ -1,0 +1,117 @@
+spring:
+  application:
+    name: agentic-url-shortener
+
+  # Virtual Threads (Java 21+)
+  threads:
+    virtual:
+      enabled: true
+
+  datasource:
+    url: jdbc:h2:mem:urlshortener
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+    open-in-view: false  # no lazy loading during view rendering; transactions end in the service layer
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 60000
+
+  cache:
+    type: simple  # 'redis' in the local and docker profiles
+
+  # Model settings live here so every profile (and the tests) gets the same key
+  # mapping and the same cost cap. Only used when orchestration.agents.mode=claude.
+  ai:
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY:}   # env variable only; never commit a key
+      chat:
+        options:
+          model: claude-sonnet-5-5     # stronger model for the demo; no extended thinking
+          max-tokens: 2048             # hard cap on cost per call
+
+server:
+  port: 8080
+  compression:
+    enabled: true
+
+# Application Configuration
+url-shortener:
+  base-url: http://localhost:8080
+  short-code-length: 7
+  cache:
+    ttl: 3600  # 1 hour in seconds
+  rate-limit:
+    enabled: false  # Will implement later
+    requests-per-hour: 100
+
+# Orchestration guardrails
+orchestration:
+  # Which agent implementations run. stub = free and deterministic (default, used by tests).
+  # claude = real model calls for requirements; needs ANTHROPIC_API_KEY. Design stays stubbed.
+  agents:
+    mode: ${ORCHESTRATION_AGENTS_MODE:stub}
+  agent:
+    max-concurrent-calls: 4          # global cap on in-flight agent/LLM calls
+    max-concurrent-calls-per-run: 2  # one run cannot starve the others
+    acquire-timeout: 30s             # wait this long for a permit, then fail (retryable)
+
+# Actuator and observability
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true  # liveness/readiness probes
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  observations:
+    key-values:
+      application: ${spring.application.name}
+  tracing:
+    # Trace and span IDs are still created and written to the logs (see logging.pattern).
+    # Export is off because no OTLP collector is configured; to enable, set
+    # management.opentelemetry.tracing.export.otlp.endpoint and turn this on.
+    # The same applies to the otlp metrics/logging switches below.
+    export:
+      enabled: false
+  # The OpenTelemetry starter also pushes metrics and logs over OTLP by default.
+  # Off until a collector exists; metrics stay available at /actuator/prometheus.
+  otlp:
+    metrics:
+      export:
+        enabled: false
+  logging:
+    export:
+      otlp:
+        enabled: false
+
+# Logging
+logging:
+  level:
+    com.schwab: DEBUG
+    org.springframework.web: INFO
+    org.hibernate: INFO
+  pattern:
+    level: "%5p [${spring.application.name:},%X{traceId:-},%X{spanId:-}]"

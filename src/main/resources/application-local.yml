@@ -1,0 +1,38 @@
+# Profile for running the app from IntelliJ against the Docker Compose databases.
+#   1. docker compose up -d postgres redis
+#   2. IntelliJ run config -> Active profiles: local
+# Same setup as application-docker.yml, but services are reached via localhost
+# (ports published by docker-compose.yml) instead of the Compose service names.
+
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/urlshortener
+    driver-class-name: org.postgresql.Driver
+    username: urlshortener
+    password: ${POSTGRES_PASSWORD:urlshortener_password}
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+
+  h2:
+    console:
+      enabled: false
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: ${REDIS_PASSWORD:redis_password}
+
+  cache:
+    type: redis
+    redis:
+      time-to-live: 60s   # short TTL so analytics refresh while you test
+  # Anthropic model settings are in application.yml (shared by all profiles).
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0  # trace every request while developing (default is 0.1)
