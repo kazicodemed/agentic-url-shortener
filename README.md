@@ -194,9 +194,10 @@ url-shortener:
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/v1/runs` | Start a run: `{"requirement": "..."}` |
+| POST | `/api/v1/runs` | Start a run: `{"requirement": "...", "reviewPlan": false}` |
 | GET | `/api/v1/runs/{id}` | Run status, tasks, outputs, audit trail, decisions |
 | GET | `/api/v1/runs/metrics` | Success rate, retry and rollback frequency, MTTR, latency |
+| POST | `/api/v1/runs/{id}/reject` | Reject the plan with a comment: `{"rejectedBy": "...", "comment": "..."}`; design re-plans |
 | POST | `/api/v1/runs/{id}/approve` | Answer the open question: `{"approvedBy": "...", "decision": "..."}` |
 
 Full walkthrough in [ORCHESTRATION.md](ORCHESTRATION.md).
@@ -211,7 +212,8 @@ Full walkthrough in [ORCHESTRATION.md](ORCHESTRATION.md).
 - [x] Execution stage: parallel waves on virtual threads, synchronization, safe-stop and rollback
 - [x] Three scenarios: greenfield, brownfield (schema change approval), ambiguous
 - [x] Reliability metrics: success rate, retry and rollback frequency, MTTR, latency
-- [x] Claude requirements agent (Spring AI) behind a config switch; stub stays default
-- [ ] Claude design agent and model-backed executor; review gate after design; re-planning
+- [x] Claude requirements and design agents (Spring AI) behind a config switch; stubs stay default
+- [x] Plan review gate after design, with bounded re-planning on rejection
+- [ ] Model-backed task executor
 
 See also: [ENGINEERING_JUDGEMENT.md](ENGINEERING_JUDGEMENT.md) · [UPGRADE.md](UPGRADE.md) · [DOCKER.md](DOCKER.md)

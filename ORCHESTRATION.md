@@ -2,8 +2,9 @@
 
 An orchestration layer that takes a plain-English change request through the software
 lifecycle — **requirements → (human, if needed) → design → execution** — with validation
-gates, bounded retries, human approval, decision lineage, parallel execution with
-synchronization, safe-stop and rollback, reliability metrics and a full audit trail. Every step is persisted, so a run can wait for a person for days and
+gates, bounded retries, human approval, an optional plan review with bounded re-planning,
+decision lineage, parallel execution with synchronization, safe-stop and rollback,
+reliability metrics and a full audit trail. Every step is persisted, so a run can wait for a person for days and
 resume exactly where it stopped.
 
 > Built in Java 21 / Spring Boot 4.1 / Spring AI. The same design maps directly to
@@ -25,7 +26,11 @@ flowchart TD
     R --> D[DESIGN task RUNNING<br/>spec + human decisions]
     D --> E{DesignStep<br/>agent → DAG validator<br/>max 2 attempts}
     E -- invalid twice / agent error --> F
-    E -- valid DAG --> W[DagScheduler.waves<br/>e.g. T1 → T2, T3 → T4]
+    E -- valid DAG, reviewPlan=false --> W[DagScheduler.waves<br/>e.g. T1 → T2, T3 → T4]
+    E -- valid DAG, reviewPlan=true --> P[DESIGN + run AWAITING_HUMAN<br/>plan ready for review]
+    P -- POST /approve --> W
+    P -- POST /reject + comment<br/>max 2 re-plans --> D
+    P -- 3rd rejection --> F
     W --> X{ExecutionStep<br/>each wave in parallel<br/>on virtual threads}
     X -- allOf.join: whole wave done --> Y{any task failed?}
     Y -- no, more waves --> X
@@ -161,7 +166,24 @@ A clear request needs no person: *"Add an endpoint that returns total clicks"* g
 `RUNNING → COMPLETED` in about 0.6 s with **0 human decisions**, and its plan runs T1 and
 T3 together in the first wave.
 
-A second `approve`, or approving a run that is not waiting, returns **409 Conflict**.
+**Plan review and re-planning (opt-in per run):**
+
+```bash
+# ask for a plan review: the run stops after design, before anything is executed
+curl -s -X POST localhost:8080/api/v1/runs -H 'Content-Type: application/json' \
+     -d '{"requirement":"Add an endpoint that returns total clicks","reviewPlan":true}'
+
+# reject with a comment → stored as a decision; design re-plans with it; the new plan waits for review
+curl -s -X POST localhost:8080/api/v1/runs/<id>/reject -H 'Content-Type: application/json' \
+     -d '{"rejectedBy":"kazi","comment":"put the count behind a cached service method"}'
+
+# approve the new plan → executed in waves
+curl -s -X POST localhost:8080/api/v1/runs/<id>/approve -H 'Content-Type: application/json' \
+     -d '{"approvedBy":"kazi","decision":"better"}'
+```
+
+A second `approve`, or approving a run that is not waiting, returns **409 Conflict**;
+rejecting while the run waits on a requirements question (not a plan) is also a 409.
 
 ---
 
@@ -170,30 +192,35 @@ A second `approve`, or approving a run that is not waiting, returns **409 Confli
 | Package | What lives there | Role |
 |---|---|---|
 | `orchestration.agent.requirements` | `RequirementsAgent`, `RequirementSpec`, `Ambiguity`, `RequirementSpecValidator`, `StubRequirementsAgent` | Turn a raw request into intent, functional requirements and ambiguities rated LOW / MEDIUM / HIGH |
-| `orchestration.agent.design` | `DesignAgent`, `DesignSpec`, `PlannedTask`, `HumanDecision`, `DesignSpecValidator`, `StubDesignAgent` | Turn the spec + human decisions into a task DAG (`dependsOn`) |
+| `orchestration.agent.design` | `DesignAgent`, `DesignSpec`, `PlannedTask`, `HumanDecision`, `DesignSpecValidator`, `StubDesignAgent`, `ClaudeDesignAgent` | Turn the spec + human decisions into a task DAG (`dependsOn`) |
 | `orchestration.step` | `RequirementsStep`, `DesignStep`, `StepOutcome`, `StepStatus` | Evaluator-optimizer loop: call agent → validate → feed errors back → bounded retry |
 | `orchestration.execution` | `DagScheduler`, `ExecutionStep`, `TaskExecutor`, `StubTaskExecutor`, `TaskResult`, `ExecutionOutcome` | Groups the plan into waves; runs each wave in parallel on virtual threads; stops safely on failure |
 | `orchestration.engine` | `OrchestrationEngine`, `RunView`, `ReliabilityMetricsService` | Runs stages in order, maps outcomes to state, handles approval, resume, safe-stop and rollback; computes reliability metrics |
 | `orchestration.run` | `OrchestrationRun`, `TaskExecution`, `StateTransition`, `DecisionRecord` + repositories | Persistent state, append-only audit trail, decision lineage |
-| `orchestration.api` | `RunController` | `POST /runs`, `GET /runs/{id}`, `POST /runs/{id}/approve`, `GET /runs/metrics` |
+| `orchestration.api` | `RunController` | `POST /runs`, `GET /runs/{id}`, `POST /runs/{id}/approve`, `POST /runs/{id}/reject`, `GET /runs/metrics` |
 
 Agents are **interfaces**. The stubs are the default implementation, so tests and demos
-are deterministic and cost nothing. `ClaudeRequirementsAgent` (Spring AI `ChatClient`,
-structured output into `RequirementSpec`) plugs in behind the same interface without
-touching the engine, steps or validators.
+are deterministic and cost nothing. `ClaudeRequirementsAgent` and `ClaudeDesignAgent`
+(Spring AI `ChatClient`, structured output into `RequirementSpec` / `DesignSpec`) plug in
+behind the same interfaces without touching the engine, steps or validators.
 
 ### Switching to the real model
 
 ```yaml
 orchestration.agents.mode: stub     # default: free, deterministic, used by all tests
-orchestration.agents.mode: claude   # requirements stage calls Claude; design stays stubbed
+orchestration.agents.mode: claude   # requirements and design call Claude; execution stays stubbed
 ```
 
-Exactly one `RequirementsAgent` bean exists at a time (`@ConditionalOnProperty`, with
+Exactly one bean per agent interface exists at a time (`@ConditionalOnProperty`, with
 `matchIfMissing = true` on the stub), so a missing setting can never cause a paid call.
 The key is read only from the `ANTHROPIC_API_KEY` environment variable (or `.env` via
 Docker Compose); model and `max-tokens` cap live in the base `application.yml`, so every
 profile gets the same cost limit.
+
+The design agent's prompt carries a short map of this codebase (controllers, services,
+repositories, entities) so plans name real classes, the same DAG rules the validator
+enforces, and the human decisions as **fixed constraints** — including review comments,
+which is how a rejected plan is redesigned.
 
 The model's answer is **not trusted**: it goes through the same validator as the stub's,
 and on a retry the validator's errors are appended to the prompt
@@ -209,7 +236,8 @@ and on a retry the validator's errors are appended to the prompt
 | **Sequential and parallel paths with synchronization** | Tasks in a wave run in parallel on virtual threads (`CompletableFuture.supplyAsync`); `allOf().join()` is the barrier, so a task starts only when everything it depends on has finished. `ExecutionStepTest` measures that T2 and T3 overlap and T4 starts after both end. |
 | **Safe-stop and rollback** | A failed task stops the run: later tasks are `SKIPPED`, completed tasks are `ROLLED_BACK`, the run is `FAILED` with the reason (`"safe-stop: [T2] failed; skipped [T4]…"`). A crashing worker becomes a failed result, never a crashed run. |
 | **Gates** | Each stage's validator is a gate: nothing reaches the next stage unvalidated. |
-| **Human approval** | HIGH-impact ambiguity → `AWAITING_HUMAN`; `approve` resumes. Guarded against double approval (409). |
+| **Human approval** | HIGH-impact ambiguity → `AWAITING_HUMAN`; `approve` resumes. Optional plan review per run (`reviewPlan`): nothing executes until a person approves the plan. Guarded against double approval (409). |
+| **Dynamic re-planning** | A rejected plan's comment is stored as a decision and design re-runs with every decision as a constraint; the old plan is kept as `SUPERSEDED`. Bounded: after 2 re-plans, another rejection stops the run safely. Re-planning reuses the stored requirements spec — no repeated model call. |
 | **Bounded retries** | `MAX_ATTEMPTS = 2` per step; validator errors are the feedback. Agent exceptions are not retried (the model client already retries transport errors — no stacked retries). |
 | **Audit trail** | `StateTransition`: every status change of the run and each task, with a reason, append-only. |
 | **Decision lineage** | `DecisionRecord`: question, answer, who, when — stored as data and passed to later stages. |
@@ -304,6 +332,17 @@ invalidation would be worse than shipping nothing. For independent work (e.g. fe
 data for many symbols) the right policy is the opposite: skip only the failed task's
 transitive dependents and keep going (Maven's fail-at-end). It is a per-run policy choice.
 
+**Two kinds of human gate, one mechanism.** A run stops for a person when it needs a
+*fact* only a person knows (peak load), a *permission* for a risky action (a schema
+change), or a *review* of the plan. All three are the same thing in the engine — a task
+`AWAITING_HUMAN`, resolved by `approve` (or `reject` for a plan) — and every answer is a
+`DecisionRecord` that later stages receive.
+
+**Re-planning is bounded and keeps history.** A rejected plan is never edited or deleted;
+it becomes `SUPERSEDED` and a new design task is created, so the audit trail shows every
+plan a person saw and why each was rejected. A cap on re-plans prevents an endless
+reject/redesign loop.
+
 **Validator messages are written for the model.** They say how to fix the problem
 (`"dependsOn must not be null; use [] if there are none"`), because they become the
 retry prompt. Precise feedback means fewer retries and lower cost.
@@ -318,9 +357,10 @@ retry prompt. Precise feedback means fewer retries and lower cost.
 - **One DB transaction spans the agent call.** Instant with stubs; with a real model
   (seconds) the work should be split so no connection is held while waiting —
   e.g. commit `RUNNING`, call the model outside a transaction, commit the result.
-- **No human review gate after design.** Design runs autonomously once requirements
-  are settled. Next step: optional `AWAITING_HUMAN` after design, approve or reject
-  with a comment; a rejection is stored as a decision and design re-runs with it.
+- **Plan review is opt-in per run** (`reviewPlan`), not driven by policy. A policy could
+  require it automatically for high-impact plans (schema changes, many tasks).
+- **Re-planning starts from design.** A changed requirement would need the requirements
+  stage to re-run as well; today a new run is the way to change the request itself.
 - **Kahn reports blocked tasks, not only the exact cycle.** A task downstream of a
   cycle is listed too. Good enough as retry feedback for ≤ 10 tasks; a DFS would
   isolate the cycle precisely.
@@ -346,9 +386,8 @@ retry prompt. Precise feedback means fewer retries and lower cost.
 
 ## 9. What I would add next
 
-1. A model-backed design agent (the requirements agent is done); the prompt passes human
-   decisions as fixed constraints.
-2. Human review gate after design, with reject-and-replan.
+1. Policy-driven plan review: require it automatically for high-impact plans.
+2. Re-planning from any stage, including requirements when the request itself changes.
 3. A model-backed `TaskExecutor`: propose a diff per task on a branch, validate with the
    test suite, and wire `AgentConcurrencyLimiter` around the parallel model calls.
 4. Re-planning: if design fails twice, or upstream outputs change, return to the earlier
@@ -361,10 +400,12 @@ retry prompt. Precise feedback means fewer retries and lower cost.
 ## 10. Tests
 
 ```bash
-mvn clean test      # ~91 tests, no API key, no network calls to a model
+mvn clean test      # ~101 tests, no API key, no network calls to a model
 ```
 
-- Real model: `ClaudeRequirementsAgentIT` runs only when `ANTHROPIC_API_KEY` is set.
+- Real model: `ClaudeRequirementsAgentIT` and `ClaudeDesignAgentIT` run only when
+  `ANTHROPIC_API_KEY` is set. (Prompt-building is unit-tested for free in
+  `ClaudeRequirementsAgentTest` and `ClaudeDesignAgentTest`.)
   It makes one call and asserts the **contract**, not the wording: the spec passes the
   validator and the vague request is flagged with a HIGH ambiguity.
   `ClaudeRawResponseIT` (disabled by default) prints the raw response for debugging.
@@ -376,4 +417,6 @@ mvn clean test      # ~91 tests, no API key, no network calls to a model
   measures that tasks in a wave overlap and the next wave waits for all of them —
   and `ExecutionSafeStopTest` (T2 fails → T4 skipped, T1 and T3 rolled back, run failed).
 - `ScenarioTest`: greenfield, brownfield and ambiguous, end to end.
+- `PlanReviewTest`: the gate holds execution until approval; reject → re-plan → approve;
+  re-planning stops safely at its limit; both gates in one run.
 - `ReliabilityMetricsTest`: a failure, a recovery and a human wait, then every metric checked.
