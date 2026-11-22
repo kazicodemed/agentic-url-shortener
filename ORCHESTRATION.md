@@ -65,18 +65,13 @@ curl -s -X POST localhost:8080/api/v1/runs -H 'Content-Type: application/json' \
      -d '{"requirement":"Add an endpoint that returns total clicks"}'
 ```
 
-### Example output (real run, stub agents; ids and timestamps shortened)
+### Example output (real run in Docker, stub agents; ids and timestamps shortened)
 
-> Captured before the execution stage was added. A run now also contains one
-> `EXECUTE T1…T4` task per planned task, and the audit trail ends with their results
-> before `all stages completed`.
-
-**1. Start** — `POST /api/v1/runs` → `201 Created`, `Location: /api/v1/runs/07d96913-…`
+**1. Start** — `POST /api/v1/runs` with `"Make the system more scalable"` → `201 Created`
 
 ```json
 {
-  "id": "07d96913-…",
-  "rawRequirement": "Make the system more scalable",
+  "id": "c5b48c7e-…",
   "status": "AWAITING_HUMAN",
   "tasks": [{
     "taskType": "REQUIREMENTS", "status": "AWAITING_HUMAN", "attempts": 1,
@@ -100,16 +95,16 @@ curl -s -X POST localhost:8080/api/v1/runs -H 'Content-Type: application/json' \
 
 The HIGH ambiguity stops the run; the LOW one is settled by its proposed default.
 
-**2. Approve** — `POST /api/v1/runs/07d96913-…/approve` with
+**2. Approve** — `POST /api/v1/runs/c5b48c7e-…/approve` with
 `{"approvedBy":"kazi","decision":"Plan for 5,000 redirects per second"}`
 
 ```json
 {
-  "id": "07d96913-…",
+  "id": "c5b48c7e-…",
   "status": "COMPLETED",
   "tasks": [
-    { "taskType": "REQUIREMENTS", "status": "COMPLETED", "attempts": 1, "output": { "…": "unchanged" } },
-    { "taskType": "DESIGN", "status": "COMPLETED", "attempts": 1,
+    { "taskType": "REQUIREMENTS", "status": "COMPLETED" },
+    { "taskType": "DESIGN", "status": "COMPLETED",
       "output": {
         "approach": "Cache short-code lookups in Redis to serve 5,000 redirects/sec",
         "tasks": [
@@ -117,37 +112,54 @@ The HIGH ambiguity stops the run; the LOW one is settled by its proposed default
           { "id": "T2", "title": "Invalidate cache on URL update or expiry", "dependsOn": ["T1"] },
           { "id": "T3", "title": "Add load test for 5,000 redirects/sec",    "dependsOn": ["T1"] },
           { "id": "T4", "title": "Document capacity and cache TTL decision", "dependsOn": ["T2", "T3"] }
-        ]
-      } }
+        ] } },
+    { "taskType": "EXECUTE T1", "status": "COMPLETED",
+      "output": { "taskId": "T1", "success": true,
+                  "output": "simulated change for T1: Add Redis cache for short-code lookups" } },
+    { "taskType": "EXECUTE T2", "status": "COMPLETED", "…": "…" },
+    { "taskType": "EXECUTE T3", "status": "COMPLETED", "…": "…" },
+    { "taskType": "EXECUTE T4", "status": "COMPLETED", "…": "…" }
   ],
   "decisions": [
     { "question": "What peak load must the system handle?",
       "decision": "Plan for 5,000 redirects per second",
-      "decidedBy": "kazi", "decidedAt": "2026-11-21T05:37:33" }
+      "decidedBy": "kazi", "decidedAt": "2026-11-22T02:31:25" }
   ]
 }
 ```
 
-The design plan is built from the human's answer: Redis caching and a load test at
-5,000/sec. Without that answer the same request would have stopped; a request that
-needs no answer gets the simple plan instead.
+The design plan is built from the human's answer (Redis caching and a load test at
+5,000/sec), then executed in three waves: `[T1]`, `[T2, T3]` in parallel, `[T4]`.
 
-**3. Audit trail** (from `GET /api/v1/runs/07d96913-…`, the same after a restart)
+**3. Audit trail** (from `GET /api/v1/runs/c5b48c7e-…`, the same after a restart)
 
 | Time | Scope | From → To | Reason |
 |---|---|---|---|
-| 05:33:41.110 | RUN | — → RUNNING | run created |
-| 05:33:41.145 | REQUIREMENTS | PENDING → RUNNING | requirements analysis started |
-| 05:33:41.198 | REQUIREMENTS | RUNNING → AWAITING_HUMAN | HIGH impact ambiguity: What peak load must the system handle? |
-| 05:33:41.201 | RUN | RUNNING → AWAITING_HUMAN | waiting for a person to resolve the ambiguity |
-| 05:37:33.555 | REQUIREMENTS | AWAITING_HUMAN → COMPLETED | approved by kazi: Plan for 5,000 redirects per second |
-| 05:37:33.556 | RUN | AWAITING_HUMAN → RUNNING | resumed after human approval |
-| 05:37:33.572 | DESIGN | PENDING → RUNNING | design started with 1 human decision(s) |
-| 05:37:33.583 | DESIGN | RUNNING → COMPLETED | plan validated: 4 tasks |
-| 05:37:33.584 | RUN | RUNNING → COMPLETED | all stages completed |
+| 02:27:36.468 | RUN | — → RUNNING | run created |
+| 02:27:36.471 | REQUIREMENTS | PENDING → RUNNING | requirements analysis started |
+| 02:27:36.484 | REQUIREMENTS | RUNNING → AWAITING_HUMAN | HIGH impact ambiguity: What peak load must the system handle? |
+| 02:27:36.485 | RUN | RUNNING → AWAITING_HUMAN | waiting for a person to resolve the ambiguity |
+| 02:31:25.270 | REQUIREMENTS | AWAITING_HUMAN → COMPLETED | approved by kazi: Plan for 5,000 redirects per second |
+| 02:31:25.271 | RUN | AWAITING_HUMAN → RUNNING | resumed after human approval |
+| 02:31:25.283 | DESIGN | PENDING → RUNNING | design started with 1 human decision(s) |
+| 02:31:25.290 | DESIGN | RUNNING → COMPLETED | plan validated: 4 tasks |
+| 02:31:25.904 | EXECUTE T1 | PENDING → COMPLETED | executed: Add Redis cache for short-code lookups |
+| 02:31:25.905 | EXECUTE T2 | PENDING → COMPLETED | executed: Invalidate cache on URL update or expiry |
+| 02:31:25.906 | EXECUTE T3 | PENDING → COMPLETED | executed: Add load test for 5,000 redirects/sec |
+| 02:31:25.907 | EXECUTE T4 | PENDING → COMPLETED | executed: Document capacity and cache TTL decision |
+| 02:31:25.908 | RUN | RUNNING → COMPLETED | all stages completed |
 
-The four-minute gap between 05:33 and 05:37 is the run waiting for a person, with nothing
-held in memory.
+Two things to read from the timestamps:
+
+- **The four-minute gap** (02:27 → 02:31) is the run waiting for a person, with nothing
+  held in memory.
+- **Execution took ~0.61 s** (25.290 → 25.904) for four tasks of 200 ms each. Run one by
+  one they would take 0.8 s; three waves with T2 and T3 in parallel take 0.6 s.
+  (Execution rows are recorded together after the last wave — see limitations.)
+
+A clear request needs no person: *"Add an endpoint that returns total clicks"* goes
+`RUNNING → COMPLETED` in about 0.6 s with **0 human decisions**, and its plan runs T1 and
+T3 together in the first wave.
 
 A second `approve`, or approving a run that is not waiting, returns **409 Conflict**.
 
