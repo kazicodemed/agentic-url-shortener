@@ -5,6 +5,10 @@ import com.schwab.urlshortener.orchestration.agent.design.DesignSpec;
 import com.schwab.urlshortener.orchestration.agent.design.HumanDecision;
 import com.schwab.urlshortener.orchestration.agent.requirements.Ambiguity;
 import com.schwab.urlshortener.orchestration.agent.requirements.RequirementSpec;
+import com.schwab.urlshortener.orchestration.execution.ExecutionOutcome;
+import com.schwab.urlshortener.orchestration.execution.ExecutionStep;
+import com.schwab.urlshortener.orchestration.execution.TaskResult;
+import com.schwab.urlshortener.orchestration.agent.design.PlannedTask;
 import com.schwab.urlshortener.orchestration.run.*;
 import com.schwab.urlshortener.orchestration.step.DesignStep;
 import com.schwab.urlshortener.orchestration.step.RequirementsStep;
@@ -16,11 +20,13 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 import tools.jackson.databind.ObjectMapper;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
- * Coordinates a run through its stages: REQUIREMENTS → (human, if needed) → DESIGN.
+ * Coordinates a run through its stages: REQUIREMENTS → (human, if needed) → DESIGN → EXECUTE.
  *
  * <p>Rule: write the state first, then act. Each task is saved as RUNNING before
  * its agent is called, so an interrupted call leaves evidence behind.
@@ -38,6 +44,7 @@ public class OrchestrationEngine {
 
     static final String REQUIREMENTS = "REQUIREMENTS";
     static final String DESIGN = "DESIGN";
+    static final String EXECUTE_PREFIX = "EXECUTE ";
 
     private final OrchestrationRunRepository runRepo;
     private final TaskExecutionRepository taskRepo;
@@ -45,6 +52,7 @@ public class OrchestrationEngine {
     private final DecisionRecordRepository decisionRecordRepository;
     private final RequirementsStep requirementsStep;
     private final DesignStep designStep;
+    private final ExecutionStep executionStep;
     private final ObjectMapper objectMapper;
 
     // ---------------------------------------------------------------- public API
@@ -155,10 +163,67 @@ public class OrchestrationEngine {
             case COMPLETED -> {
                 changeTaskStatus(run, task, TaskStatus.COMPLETED,
                         "plan validated: " + outcome.output().tasks().size() + " tasks");
-                changeRunStatus(run, RunStatus.COMPLETED, "all stages completed");
+                runExecution(run, outcome.output());
             }
             default -> fail(run, task, "design failed: " + String.join("; ", outcome.errors()));
         }
+    }
+
+    /**
+     * Execution stage: one task row per planned task, then {@link ExecutionStep} runs the plan
+     * in waves (parallel within a wave, on virtual threads). Worker threads never touch JPA:
+     * every state change below is recorded here, on the engine thread, after the waves return.
+     *
+     * <p>On failure the run stops safely: tasks that never started are SKIPPED, and tasks that
+     * had completed are ROLLED_BACK, so the run never ends half-applied.
+     */
+    private void runExecution(OrchestrationRun run, DesignSpec plan) {
+        // write state first: every planned task exists as PENDING before any work starts
+        Map<String, TaskExecution> rows = new LinkedHashMap<>();
+        for (PlannedTask planned : plan.tasks()) {
+            rows.put(planned.id(), taskRepo.save(TaskExecution.builder()
+                    .run(run)
+                    .taskType(EXECUTE_PREFIX + planned.id())
+                    .status(TaskStatus.PENDING)
+                    .build()));
+        }
+
+        ExecutionOutcome outcome = executionStep.run(plan.tasks());
+
+        for (TaskResult result : outcome.results()) {
+            TaskExecution row = rows.get(result.taskId());
+            row.setAttempts(1);
+            row.setOutputJson(objectMapper.writeValueAsString(result));
+            if (result.success()) {
+                changeTaskStatus(run, row, TaskStatus.COMPLETED, "executed: " + plannedTitle(plan, result.taskId()));
+            } else {
+                row.setErrors(result.error());
+                changeTaskStatus(run, row, TaskStatus.FAILED, "execution failed: " + result.error());
+            }
+        }
+
+        if (outcome.succeeded()) {
+            changeRunStatus(run, RunStatus.COMPLETED, "all stages completed");
+            return;
+        }
+
+        String failed = outcome.results().stream().filter(r -> !r.success()).map(TaskResult::taskId).toList().toString();
+        for (String skippedId : outcome.skippedTaskIds()) {
+            changeTaskStatus(run, rows.get(skippedId), TaskStatus.SKIPPED, "not started: " + failed + " failed");
+        }
+        for (TaskResult result : outcome.results()) {
+            if (result.success()) {
+                changeTaskStatus(run, rows.get(result.taskId()), TaskStatus.ROLLED_BACK,
+                        "rolled back: " + failed + " failed in the same run");
+            }
+        }
+        changeRunStatus(run, RunStatus.FAILED,
+                "safe-stop: " + failed + " failed; skipped " + outcome.skippedTaskIds() + "; completed tasks rolled back");
+    }
+
+    private static String plannedTitle(DesignSpec plan, String taskId) {
+        return plan.tasks().stream().filter(t -> t.id().equals(taskId))
+                .map(PlannedTask::title).findFirst().orElse(taskId);
     }
 
     // ---------------------------------------------------------------- helpers

@@ -61,7 +61,9 @@ class OrchestrationEngineTest {
         RunView view = engine.getRun(run.getId());
         assertThat(view.tasks())
                 .extracting(t -> t.taskType() + ":" + t.status())
-                .containsExactlyInAnyOrder("REQUIREMENTS:COMPLETED", "DESIGN:COMPLETED");
+                .containsExactlyInAnyOrder("REQUIREMENTS:COMPLETED", "DESIGN:COMPLETED",
+                        "EXECUTE T1:COMPLETED", "EXECUTE T2:COMPLETED", "EXECUTE T3:COMPLETED",
+                        "EXECUTE T4:COMPLETED");
         assertThat(view.auditTrail())
                 .extracting(t -> t.scope() + ": " + t.fromStatus() + " -> " + t.toStatus())
                 .containsExactlyInAnyOrder(
@@ -70,6 +72,10 @@ class OrchestrationEngineTest {
                         "REQUIREMENTS: RUNNING -> COMPLETED",
                         "DESIGN: PENDING -> RUNNING",
                         "DESIGN: RUNNING -> COMPLETED",
+                        "EXECUTE T1: PENDING -> COMPLETED",
+                        "EXECUTE T2: PENDING -> COMPLETED",
+                        "EXECUTE T3: PENDING -> COMPLETED",
+                        "EXECUTE T4: PENDING -> COMPLETED",
                         "RUN: RUNNING -> COMPLETED");
         // no human answered anything, so the stub plans the simple change
         assertThat(designOf(view).output().get("approach").asString()).doesNotContain("Redis");
@@ -93,6 +99,10 @@ class OrchestrationEngineTest {
                         "RUN: AWAITING_HUMAN -> RUNNING",
                         "DESIGN: PENDING -> RUNNING",
                         "DESIGN: RUNNING -> COMPLETED",
+                        "EXECUTE T1: PENDING -> COMPLETED",
+                        "EXECUTE T2: PENDING -> COMPLETED",
+                        "EXECUTE T3: PENDING -> COMPLETED",
+                        "EXECUTE T4: PENDING -> COMPLETED",
                         "RUN: RUNNING -> COMPLETED");
         assertThat(view.auditTrail())
                 .anySatisfy(t -> assertThat(t.reason()).contains("approved by kazi"));
