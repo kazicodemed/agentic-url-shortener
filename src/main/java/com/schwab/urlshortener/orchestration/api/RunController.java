@@ -1,6 +1,8 @@
 package com.schwab.urlshortener.orchestration.api;
 
 import com.schwab.urlshortener.orchestration.engine.OrchestrationEngine;
+import com.schwab.urlshortener.orchestration.engine.ReliabilityMetrics;
+import com.schwab.urlshortener.orchestration.engine.ReliabilityMetricsService;
 import com.schwab.urlshortener.orchestration.engine.RunView;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -15,6 +17,8 @@ import java.util.UUID;
 /**
  * POST /api/v1/runs          start a run for a requirement
  * GET  /api/v1/runs/{id}     the run, its tasks and its audit trail
+ * POST /api/v1/runs/{id}/approve  a person answers the open question; the run resumes
+ * GET  /api/v1/runs/metrics  reliability metrics across all runs
  */
 @RestController
 @RequestMapping("/api/v1/runs")
@@ -22,6 +26,7 @@ import java.util.UUID;
 public class RunController {
 
     private final OrchestrationEngine engine;
+    private final ReliabilityMetricsService metricsService;
 
     public record StartRunRequest(@NotBlank String requirement) {}
 
@@ -31,6 +36,11 @@ public class RunController {
         return ResponseEntity.status(HttpStatus.CREATED)
                 .location(URI.create("/api/v1/runs/" + id))
                 .body(engine.getRun(id));
+    }
+
+    @GetMapping("/metrics")
+    public ReliabilityMetrics metrics() {
+        return metricsService.compute();
     }
 
     @GetMapping("/{id}")

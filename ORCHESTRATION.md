@@ -1,9 +1,9 @@
 # Agentic SDLC Orchestration
 
-An orchestration layer that takes a plain-English change request through the first
-stages of the software lifecycle — **requirements → (human, if needed) → design** —
-with validation gates, bounded retries, human approval, decision lineage and a full
-audit trail. Every step is persisted, so a run can wait for a person for days and
+An orchestration layer that takes a plain-English change request through the software
+lifecycle — **requirements → (human, if needed) → design → execution** — with validation
+gates, bounded retries, human approval, decision lineage, parallel execution with
+synchronization, safe-stop and rollback, reliability metrics and a full audit trail. Every step is persisted, so a run can wait for a person for days and
 resume exactly where it stopped.
 
 > Built in Java 21 / Spring Boot 4.1 / Spring AI. The same design maps directly to
@@ -25,7 +25,12 @@ flowchart TD
     R --> D[DESIGN task RUNNING<br/>spec + human decisions]
     D --> E{DesignStep<br/>agent → DAG validator<br/>max 2 attempts}
     E -- invalid twice / agent error --> F
-    E -- valid DAG --> G[Task + run COMPLETED]
+    E -- valid DAG --> W[DagScheduler.waves<br/>e.g. T1 → T2, T3 → T4]
+    W --> X{ExecutionStep<br/>each wave in parallel<br/>on virtual threads}
+    X -- allOf.join: whole wave done --> Y{any task failed?}
+    Y -- no, more waves --> X
+    Y -- no, last wave --> G[Tasks + run COMPLETED]
+    Y -- yes --> S[Safe-stop: later tasks SKIPPED,<br/>completed tasks ROLLED_BACK,<br/>run FAILED]
 ```
 
 The **demo moment**: for *"Make the system more scalable"* the requirements agent cannot
@@ -55,12 +60,16 @@ curl -s -X POST localhost:8080/api/v1/runs/<id>/approve -H 'Content-Type: applic
 # 3. inspect anything later
 curl -s localhost:8080/api/v1/runs/<id>
 
-# a clear request goes straight through both stages
+# a clear request goes straight through all stages
 curl -s -X POST localhost:8080/api/v1/runs -H 'Content-Type: application/json' \
      -d '{"requirement":"Add an endpoint that returns total clicks"}'
 ```
 
 ### Example output (real run, stub agents; ids and timestamps shortened)
+
+> Captured before the execution stage was added. A run now also contains one
+> `EXECUTE T1…T4` task per planned task, and the audit trail ends with their results
+> before `all stages completed`.
 
 **1. Start** — `POST /api/v1/runs` → `201 Created`, `Location: /api/v1/runs/07d96913-…`
 
@@ -151,9 +160,10 @@ A second `approve`, or approving a run that is not waiting, returns **409 Confli
 | `orchestration.agent.requirements` | `RequirementsAgent`, `RequirementSpec`, `Ambiguity`, `RequirementSpecValidator`, `StubRequirementsAgent` | Turn a raw request into intent, functional requirements and ambiguities rated LOW / MEDIUM / HIGH |
 | `orchestration.agent.design` | `DesignAgent`, `DesignSpec`, `PlannedTask`, `HumanDecision`, `DesignSpecValidator`, `StubDesignAgent` | Turn the spec + human decisions into a task DAG (`dependsOn`) |
 | `orchestration.step` | `RequirementsStep`, `DesignStep`, `StepOutcome`, `StepStatus` | Evaluator-optimizer loop: call agent → validate → feed errors back → bounded retry |
-| `orchestration.engine` | `OrchestrationEngine`, `RunView` | Runs stages in order, maps outcomes to state, handles approval and resume |
+| `orchestration.execution` | `DagScheduler`, `ExecutionStep`, `TaskExecutor`, `StubTaskExecutor`, `TaskResult`, `ExecutionOutcome` | Groups the plan into waves; runs each wave in parallel on virtual threads; stops safely on failure |
+| `orchestration.engine` | `OrchestrationEngine`, `RunView`, `ReliabilityMetricsService` | Runs stages in order, maps outcomes to state, handles approval, resume, safe-stop and rollback; computes reliability metrics |
 | `orchestration.run` | `OrchestrationRun`, `TaskExecution`, `StateTransition`, `DecisionRecord` + repositories | Persistent state, append-only audit trail, decision lineage |
-| `orchestration.api` | `RunController` | `POST /runs`, `GET /runs/{id}`, `POST /runs/{id}/approve` |
+| `orchestration.api` | `RunController` | `POST /runs`, `GET /runs/{id}`, `POST /runs/{id}/approve`, `GET /runs/metrics` |
 
 Agents are **interfaces**. The stubs are the default implementation, so tests and demos
 are deterministic and cost nothing. `ClaudeRequirementsAgent` (Spring AI `ChatClient`,
@@ -183,19 +193,69 @@ and on a retry the validator's errors are appended to the prompt
 
 | Requirement | Where |
 |---|---|
-| **Dependency graph** | `PlannedTask.dependsOn`; `DesignSpecValidator` rejects unknown ids, duplicates, self-dependencies and cycles (Kahn's algorithm). The topological order is also the execution order. |
+| **Dependency graph** | `PlannedTask.dependsOn`; `DesignSpecValidator` rejects unknown ids, duplicates, self-dependencies and cycles (Kahn's algorithm). `DagScheduler.waves` turns the same graph into the execution order. |
+| **Sequential and parallel paths with synchronization** | Tasks in a wave run in parallel on virtual threads (`CompletableFuture.supplyAsync`); `allOf().join()` is the barrier, so a task starts only when everything it depends on has finished. `ExecutionStepTest` measures that T2 and T3 overlap and T4 starts after both end. |
+| **Safe-stop and rollback** | A failed task stops the run: later tasks are `SKIPPED`, completed tasks are `ROLLED_BACK`, the run is `FAILED` with the reason (`"safe-stop: [T2] failed; skipped [T4]…"`). A crashing worker becomes a failed result, never a crashed run. |
 | **Gates** | Each stage's validator is a gate: nothing reaches the next stage unvalidated. |
 | **Human approval** | HIGH-impact ambiguity → `AWAITING_HUMAN`; `approve` resumes. Guarded against double approval (409). |
 | **Bounded retries** | `MAX_ATTEMPTS = 2` per step; validator errors are the feedback. Agent exceptions are not retried (the model client already retries transport errors — no stacked retries). |
 | **Audit trail** | `StateTransition`: every status change of the run and each task, with a reason, append-only. |
 | **Decision lineage** | `DecisionRecord`: question, answer, who, when — stored as data and passed to later stages. |
 | **Statefulness** | All state in Postgres. A waiting run survives restarts; resuming reads the stored spec instead of calling the model again. |
-| **Policy guardrails** | Implemented in code, not prompts: validators, max task count, bounded attempts, approval only from `AWAITING_HUMAN`. Concurrency limits for model calls: `AgentConcurrencyLimiter` (built, see limitations). |
-| **Observability** | Actuator + Prometheus endpoint; per-run detail via `GET /runs/{id}` (attempts, errors, outputs, trail). |
+| **Policy guardrails** | Implemented in code, not prompts: validators, max task count, bounded attempts, approval only from `AWAITING_HUMAN`, and change control — a schema change is a HIGH-impact action that needs a person's approval (brownfield scenario). Concurrency limits for model calls: `AgentConcurrencyLimiter` (built, see limitations). |
+| **Reliability metrics** | Success rate, retry rate, rollback frequency, MTTR and end-to-end latency at `GET /api/v1/runs/metrics` (computed from stored runs), plus live Micrometer meters at `/actuator/prometheus`. See section 6. |
+| **Observability** | Actuator + Prometheus endpoint; per-run detail via `GET /runs/{id}` (attempts, errors, outputs, trail, decisions). |
+| **Three scenarios** | Greenfield, brownfield and ambiguous, each end to end in `ScenarioTest`. See section 5. |
 
 ---
 
-## 5. Key design decisions
+## 5. The three scenarios
+
+Each runs end to end in `ScenarioTest` and shows decomposition (the plan), orchestration
+(stages, gates, waves) and validation.
+
+| | Request | What happens | What it demonstrates |
+|---|---|---|---|
+| **Greenfield** | *"Add an endpoint that returns total clicks for a short code"* | Only a LOW ambiguity, so its default is used and no person is needed. Plan: T1 count query, T2 endpoint (after T1), T3 docs, T4 tests (after T2). **T1 and T3 run in parallel** in the first wave. | Decomposition, parallel execution, autonomy inside limits |
+| **Brownfield** | *"Fix bug: custom short codes longer than 10 characters fail with a 500"* | A real bug in this codebase: `UrlShortenerService.validateCustomCode` accepts up to 20 characters, but `UrlMapping.shortCode` is a 10-character column. The fix changes the schema, a high-impact action, so the run **stops for change-control approval**. After approval the plan names the impacted modules and the data flow (`POST /api/v1/shorten → UrlShortenerController → validateCustomCode → saveWithRetry → url_mappings`). | Codebase reasoning, human approval for high-impact actions, change control |
+| **Ambiguous** | *"Make the system more scalable"* | Stops for a **missing business fact** (peak load). The answer is stored as a decision; the design plan changes because of it (Redis cache + load test at 5,000/sec). | Ambiguity handling, decision lineage, cross-stage context |
+
+The two human gates stop for different reasons: the ambiguous request needs a **fact only a
+person knows**; the brownfield fix needs a **risky action a person must approve**. Both use
+the same mechanism (a HIGH-impact ambiguity, then `approve`).
+
+---
+
+## 6. Reliability metrics
+
+`GET /api/v1/runs/metrics` — computed from stored runs, so they survive restarts and agree
+with the audit trail:
+
+```json
+{ "totalRuns": 3, "completed": 1, "failed": 1, "awaitingHuman": 1,
+  "successRate": 0.5, "retryRate": 0.0, "rollbackFrequency": 0.5,
+  "mttrSeconds": 0.06, "avgEndToEndSeconds": 0.4 }
+```
+
+| Metric | Definition |
+|---|---|
+| Success rate | completed ÷ (completed + failed) |
+| Retry rate | stage tasks that needed a second attempt ÷ stage tasks |
+| Rollback frequency | finished runs that rolled work back ÷ finished runs |
+| MTTR | from a `FAILED` run until the next `COMPLETED` run of the same requirement |
+| End-to-end latency | run created → `COMPLETED`/`FAILED`, including time waiting for a person |
+
+No data gives `null`, not `0` — "no runs yet" is not "0% success".
+
+Live meters for dashboards and alerting (`/actuator/prometheus`):
+`orchestration_stage_duration_seconds{stage}`, `orchestration_runs_total{outcome}`,
+`orchestration_stage_retries_total{stage}`, `orchestration_execution_rollbacks_total`.
+Tags have a small fixed set of values (stage, outcome) — never run ids, which would
+explode cardinality.
+
+---
+
+## 7. Key design decisions
 
 **A workflow, not a free-roaming agent.** The engine decides the order of stages; the
 model only fills in each stage's output. That makes runs predictable, testable and
@@ -222,13 +282,23 @@ called, so a crash mid-call leaves evidence instead of silence.
 of persistence, are trivial to unit-test, and nothing internal (ids, lazy links)
 leaks into a prompt you pay tokens for.
 
+**Workers compute, the engine records.** Execution tasks run on virtual threads, but
+worker threads never touch JPA: they return a `TaskResult`, and the engine thread records
+every status change after each wave. No entity or transaction is ever shared across threads.
+
+**Fail-fast inside one change set.** The planned tasks together form one change, so a
+failure stops the run and rolls back what completed — shipping the cache without its
+invalidation would be worse than shipping nothing. For independent work (e.g. fetching
+data for many symbols) the right policy is the opposite: skip only the failed task's
+transitive dependents and keep going (Maven's fail-at-end). It is a per-run policy choice.
+
 **Validator messages are written for the model.** They say how to fix the problem
 (`"dependsOn must not be null; use [] if there are none"`), because they become the
 retry prompt. Precise feedback means fewer retries and lower cost.
 
 ---
 
-## 6. Known limitations (deliberate, for scope)
+## 8. Known limitations (deliberate, for scope)
 
 - **First real call failed on response mapping** (empty content). The pipeline handled it
   as designed — the step returned `FAILED` with the error, no retry, no crash — and a
@@ -244,29 +314,42 @@ retry prompt. Precise feedback means fewer retries and lower cost.
   isolate the cycle precisely.
 - **`AgentConcurrencyLimiter` is built but not yet wired into the steps.** It matters
   once real model calls run in parallel; with stubs there is nothing to limit.
-- **No rollback stage.** A failed stage marks the task and run `FAILED` and keeps all
-  earlier outputs for inspection; nothing is deleted.
-- **The pipeline stops at a plan.** An implementation stage that executes each
-  `PlannedTask` (e.g. against the URL shortener's known bugs) is the natural next stage.
+- **Execution is simulated.** `StubTaskExecutor` returns a result shaped like real work;
+  the orchestration around it (waves, threads, barrier, safe-stop, rollback, audit) is real.
+  A model-backed executor would propose a diff on a branch and use the test suite as its
+  validator. Likewise `ROLLED_BACK` is a recorded state; real rollback would revert that branch.
+- **Waves, not fully dependency-driven scheduling.** A fast task can't start its own
+  dependents until its whole wave is done. Simpler and enough for ≤ 10 tasks; a per-task
+  scheduler would remove that wait.
+- **The audit trail records each execution task's final status**, not the moment it
+  started. A progress callback from the worker would add per-task start times.
+- **Metrics read every run.** Fine for a prototype; at production volume they become
+  aggregate SQL over a time window. Definitions stay the same.
+- **Local Postgres needs a reset after this upgrade.** `ddl-auto: update` does not change
+  the check constraint Hibernate created for the old task statuses, so existing tables
+  reject `SKIPPED`/`ROLLED_BACK`: `docker compose down -v && docker compose up -d --build`.
+  A real deployment would use versioned migrations (Flyway or Liquibase).
 
 ---
 
-## 7. What I would add next
+## 9. What I would add next
 
 1. A model-backed design agent (the requirements agent is done); the prompt passes human
    decisions as fixed constraints.
 2. Human review gate after design, with reject-and-replan.
-3. Metrics per stage: attempts, retry rate, duration, time spent waiting for humans.
-4. An implementation stage that runs the DAG in topological order, parallel where
-   independent (virtual threads + `AgentConcurrencyLimiter`).
-5. Re-planning: if design fails twice, return to requirements with the errors.
+3. A model-backed `TaskExecutor`: propose a diff per task on a branch, validate with the
+   test suite, and wire `AgentConcurrencyLimiter` around the parallel model calls.
+4. Re-planning: if design fails twice, or upstream outputs change, return to the earlier
+   stage with the errors or the new input.
+5. Per-run failure policy: fail-fast (today) or fail-at-end for independent tasks.
+6. Versioned schema migrations (Flyway) instead of `ddl-auto: update`.
 
 ---
 
-## 8. Tests
+## 10. Tests
 
 ```bash
-mvn clean test      # ~76 tests, no API key, no network calls to a model
+mvn clean test      # ~91 tests, no API key, no network calls to a model
 ```
 
 - Real model: `ClaudeRequirementsAgentIT` runs only when `ANTHROPIC_API_KEY` is set.
@@ -277,3 +360,8 @@ mvn clean test      # ~76 tests, no API key, no network calls to a model
 - Validators and steps: plain unit tests (`new`, lambda agents) — fast and exact.
 - Engine: `@SpringBootTest @Transactional` end-to-end tests for the clear path, the
   human path, the 409 guards, the audit trail and the decision-driven design plan.
+- Execution: `DagSchedulerTest` (waves), `ExecutionStepTest` with real virtual threads —
+  measures that tasks in a wave overlap and the next wave waits for all of them —
+  and `ExecutionSafeStopTest` (T2 fails → T4 skipped, T1 and T3 rolled back, run failed).
+- `ScenarioTest`: greenfield, brownfield and ambiguous, end to end.
+- `ReliabilityMetricsTest`: a failure, a recovery and a human wait, then every metric checked.

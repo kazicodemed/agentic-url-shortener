@@ -196,6 +196,7 @@ url-shortener:
 |---|---|---|
 | POST | `/api/v1/runs` | Start a run: `{"requirement": "..."}` |
 | GET | `/api/v1/runs/{id}` | Run status, tasks, outputs, audit trail, decisions |
+| GET | `/api/v1/runs/metrics` | Success rate, retry and rollback frequency, MTTR, latency |
 | POST | `/api/v1/runs/{id}/approve` | Answer the open question: `{"approvedBy": "...", "decision": "..."}` |
 
 Full walkthrough in [ORCHESTRATION.md](ORCHESTRATION.md).
@@ -207,8 +208,10 @@ Full walkthrough in [ORCHESTRATION.md](ORCHESTRATION.md).
 - [x] Requirements stage: ambiguity detection, validator, bounded retries
 - [x] Human-in-the-loop: approval gate, resume, decision lineage
 - [x] Design stage: task DAG, cycle detection (Kahn), decision-driven plans
+- [x] Execution stage: parallel waves on virtual threads, synchronization, safe-stop and rollback
+- [x] Three scenarios: greenfield, brownfield (schema change approval), ambiguous
+- [x] Reliability metrics: success rate, retry and rollback frequency, MTTR, latency
 - [x] Claude requirements agent (Spring AI) behind a config switch; stub stays default
-- [ ] Claude design agent
-- [ ] Review gate after design, metrics per stage, implementation stage
+- [ ] Claude design agent and model-backed executor; review gate after design; re-planning
 
 See also: [ENGINEERING_JUDGEMENT.md](ENGINEERING_JUDGEMENT.md) · [UPGRADE.md](UPGRADE.md) · [DOCKER.md](DOCKER.md)

@@ -13,6 +13,8 @@ import com.schwab.urlshortener.orchestration.run.*;
 import com.schwab.urlshortener.orchestration.step.DesignStep;
 import com.schwab.urlshortener.orchestration.step.RequirementsStep;
 import com.schwab.urlshortener.orchestration.step.StepOutcome;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -24,6 +26,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 /**
  * Coordinates a run through its stages: REQUIREMENTS → (human, if needed) → DESIGN → EXECUTE.
@@ -54,6 +57,7 @@ public class OrchestrationEngine {
     private final DesignStep designStep;
     private final ExecutionStep executionStep;
     private final ObjectMapper objectMapper;
+    private final MeterRegistry meterRegistry;
 
     // ---------------------------------------------------------------- public API
 
@@ -68,7 +72,7 @@ public class OrchestrationEngine {
 
         // 2. requirements stage
         TaskExecution task = startTask(run, REQUIREMENTS, "requirements analysis started");
-        StepOutcome<RequirementSpec> outcome = requirementsStep.run(rawRequirement);
+        StepOutcome<RequirementSpec> outcome = timed(REQUIREMENTS, () -> requirementsStep.run(rawRequirement));
         storeOutcome(task, outcome);
 
         switch (outcome.status()) {
@@ -156,7 +160,7 @@ public class OrchestrationEngine {
     /** Design stage: the plan is built from the requirements plus every human decision so far. */
     private void runDesign(OrchestrationRun run, RequirementSpec spec, List<HumanDecision> decisions) {
         TaskExecution task = startTask(run, DESIGN, "design started with " + decisions.size() + " human decision(s)");
-        StepOutcome<DesignSpec> outcome = designStep.run(spec, decisions);
+        StepOutcome<DesignSpec> outcome = timed(DESIGN, () -> designStep.run(spec, decisions));
         storeOutcome(task, outcome);
 
         switch (outcome.status()) {
@@ -188,7 +192,7 @@ public class OrchestrationEngine {
                     .build()));
         }
 
-        ExecutionOutcome outcome = executionStep.run(plan.tasks());
+        ExecutionOutcome outcome = timed("EXECUTE", () -> executionStep.run(plan.tasks()));
 
         for (TaskResult result : outcome.results()) {
             TaskExecution row = rows.get(result.taskId());
@@ -211,6 +215,7 @@ public class OrchestrationEngine {
         for (String skippedId : outcome.skippedTaskIds()) {
             changeTaskStatus(run, rows.get(skippedId), TaskStatus.SKIPPED, "not started: " + failed + " failed");
         }
+        meterRegistry.counter("orchestration.execution.rollbacks").increment();
         for (TaskResult result : outcome.results()) {
             if (result.success()) {
                 changeTaskStatus(run, rows.get(result.taskId()), TaskStatus.ROLLED_BACK,
@@ -239,8 +244,19 @@ public class OrchestrationEngine {
         return task;
     }
 
+    /** Stage latency per stage (p50/p95/max in Prometheus): orchestration_stage_duration_seconds. */
+    private <T> T timed(String stage, Supplier<T> work) {
+        return Timer.builder("orchestration.stage.duration")
+                .tag("stage", stage)
+                .register(meterRegistry)
+                .record(work);
+    }
+
     private void storeOutcome(TaskExecution task, StepOutcome<?> outcome) {
         task.setAttempts(outcome.attempts());
+        if (outcome.attempts() > 1) {
+            meterRegistry.counter("orchestration.stage.retries", "stage", task.getTaskType()).increment();
+        }
         if (outcome.output() != null) {
             task.setOutputJson(objectMapper.writeValueAsString(outcome.output()));
         }
@@ -270,6 +286,10 @@ public class OrchestrationEngine {
 
     private void changeRunStatus(OrchestrationRun run, RunStatus to, String reason) {
         String from = run.getStatus() == null ? null : run.getStatus().name();
+        if (to != RunStatus.RUNNING) {
+            // completed / failed / awaiting_human → success rate and human-gate rate in Prometheus
+            meterRegistry.counter("orchestration.runs", "outcome", to.name().toLowerCase()).increment();
+        }
         run.setStatus(to);
         runRepo.save(run);
         record(run, null, from, to.name(), reason);
