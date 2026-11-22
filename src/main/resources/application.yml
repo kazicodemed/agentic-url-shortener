@@ -64,7 +64,7 @@ url-shortener:
 # Orchestration guardrails
 orchestration:
   # Which agent implementations run. stub = free and deterministic (default, used by tests).
-  # claude = real model calls for requirements; needs ANTHROPIC_API_KEY. Design stays stubbed.
+  # claude = real model calls for requirements and design; needs ANTHROPIC_API_KEY. Execution stays stubbed.
   agents:
     mode: ${ORCHESTRATION_AGENTS_MODE:stub}
   agent:

@@ -1,11 +1,14 @@
 package com.schwab.urlshortener.orchestration.agent.design;
 
 import com.schwab.urlshortener.orchestration.agent.requirements.RequirementSpec;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
 
+/** Free, deterministic default. Replaced by ClaudeDesignAgent when orchestration.agents.mode=claude. */
 @Component
+@ConditionalOnProperty(name = "orchestration.agents.mode", havingValue = "stub", matchIfMissing = true)
 public class StubDesignAgent implements DesignAgent {
     @Override
     public DesignSpec design(RequirementSpec requirements, List<HumanDecision> decisions, List<String> feedback) {
