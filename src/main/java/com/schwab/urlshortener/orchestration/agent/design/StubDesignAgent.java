@@ -12,6 +12,19 @@ import java.util.List;
 public class StubDesignAgent implements DesignAgent {
     @Override
     public DesignSpec design(RequirementSpec requirements, List<HumanDecision> decisions, List<String> feedback) {
+        DesignSpec plan = basePlan(requirements, decisions);
+        // re-planning: the latest review comment visibly reshapes the plan (a real model would rethink it)
+        String latestRejection = decisions == null ? null : decisions.stream()
+                .map(HumanDecision::answer)
+                .filter(a -> a != null && a.startsWith("Rejected: "))
+                .reduce((first, second) -> second)
+                .orElse(null);
+        return latestRejection == null ? plan
+                : new DesignSpec("Revised after review (" + latestRejection.substring("Rejected: ".length())
+                        + "). " + plan.approach(), plan.tasks());
+    }
+
+    private DesignSpec basePlan(RequirementSpec requirements, List<HumanDecision> decisions) {
         boolean highLoad = decisions != null && decisions.stream()
                 .anyMatch(d -> d.answer() != null 
                         && d.answer().toLowerCase().matches(".*(/sec|per second|redirects).*"));

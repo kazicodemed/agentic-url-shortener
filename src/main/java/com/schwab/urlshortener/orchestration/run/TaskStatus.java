@@ -5,5 +5,7 @@ public enum TaskStatus {
     /** never started: an earlier task in the plan failed (safe-stop) */
     SKIPPED,
     /** had completed, then was undone because a later task in the same run failed */
-    ROLLED_BACK
+    ROLLED_BACK,
+    /** a plan a person rejected; kept for the audit trail, replaced by a new plan */
+    SUPERSEDED
 }

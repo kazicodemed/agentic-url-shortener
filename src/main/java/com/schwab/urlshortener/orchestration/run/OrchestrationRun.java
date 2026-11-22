@@ -32,6 +32,13 @@ public class OrchestrationRun {
     @Column(nullable = false)
     private LocalDateTime updatedAt;
 
+    /** Policy chosen when the run starts: a person must approve the plan before execution. */
+    private Boolean reviewPlan;
+
+    public boolean requiresPlanReview() {
+        return Boolean.TRUE.equals(reviewPlan);
+    }
+
     @PrePersist
     protected void onCreate() {
         createdAt = LocalDateTime.now();

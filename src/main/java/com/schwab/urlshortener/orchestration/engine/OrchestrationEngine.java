@@ -48,6 +48,9 @@ public class OrchestrationEngine {
     static final String REQUIREMENTS = "REQUIREMENTS";
     static final String DESIGN = "DESIGN";
     static final String EXECUTE_PREFIX = "EXECUTE ";
+    /** A rejected plan may be re-planned at most this many times; then the run stops safely. */
+    static final int MAX_REPLANS = 2;
+    static final String PLAN_REVIEW_QUESTION = "Approve this plan for execution?";
 
     private final OrchestrationRunRepository runRepo;
     private final TaskExecutionRepository taskRepo;
@@ -63,12 +66,23 @@ public class OrchestrationEngine {
 
     @Transactional
     public OrchestrationRun startRun(String rawRequirement) {
+        return startRun(rawRequirement, false);
+    }
+
+    /**
+     * @param reviewPlan when true, a person must approve the design plan before execution
+     *                   (and may reject it with a comment, which triggers re-planning)
+     */
+    @Transactional
+    public OrchestrationRun startRun(String rawRequirement, boolean reviewPlan) {
         // 1. the run exists before any work happens (status RUNNING)
         OrchestrationRun run = runRepo.save(OrchestrationRun.builder()
                 .rawRequirement(rawRequirement)
                 .status(RunStatus.RUNNING)
+                .reviewPlan(reviewPlan)
                 .build());
-        record(run, null, null, RunStatus.RUNNING.name(), "run created");
+        record(run, null, null, RunStatus.RUNNING.name(),
+                reviewPlan ? "run created (plan review required)" : "run created");
 
         // 2. requirements stage
         TaskExecution task = startTask(run, REQUIREMENTS, "requirements analysis started");
@@ -90,23 +104,18 @@ public class OrchestrationEngine {
         return run;
     }
 
-    /** A person answers the open question; the run resumes and continues to design. */
+    /**
+     * A person answers whatever the run is waiting for:
+     * an open question from requirements (→ continue to design), or the plan review (→ execute).
+     */
     @Transactional
     public OrchestrationRun approve(UUID runId, String approvedBy, String decision) {
-        OrchestrationRun run = runRepo.findById(runId)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "No run " + runId));
+        OrchestrationRun run = waitingRun(runId);
+        TaskExecution task = waitingTask(runId);
 
-        // guard: only a waiting run can be approved (a second approve gets 409)
-        if (run.getStatus() != RunStatus.AWAITING_HUMAN) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT,
-                    "Run is " + run.getStatus() + ", not awaiting a human");
+        if (DESIGN.equals(task.getTaskType())) {
+            return approvePlan(run, task, approvedBy, decision);
         }
-
-        TaskExecution task = taskRepo.findByRunId(runId).stream()
-                .filter(t -> t.getStatus() == TaskStatus.AWAITING_HUMAN)
-                .findFirst()
-                .orElseThrow(() -> new IllegalStateException(
-                        "Run " + runId + " is AWAITING_HUMAN but has no task awaiting a human"));
 
         RequirementSpec spec = objectMapper.readValue(task.getOutputJson(), RequirementSpec.class);
 
@@ -122,6 +131,42 @@ public class OrchestrationEngine {
         changeRunStatus(run, RunStatus.RUNNING, "resumed after human approval");
 
         runDesign(run, spec, decisionsFor(runId));
+        return run;
+    }
+
+    /**
+     * A person rejects the plan with a comment. The comment is stored as a decision and design
+     * re-plans with it (re-planning when upstream input changes). Bounded: after
+     * {@value #MAX_REPLANS} re-plans, another rejection stops the run safely.
+     */
+    @Transactional
+    public OrchestrationRun rejectPlan(UUID runId, String rejectedBy, String comment) {
+        OrchestrationRun run = waitingRun(runId);
+        TaskExecution task = waitingTask(runId);
+        if (!DESIGN.equals(task.getTaskType())) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "Run is waiting for " + task.getTaskType() + ", not for a plan review");
+        }
+
+        decisionRecordRepository.save(DecisionRecord.builder()
+                .run(run).task(task)
+                .question(PLAN_REVIEW_QUESTION)
+                .decision("Rejected: " + comment)
+                .decidedBy(rejectedBy)
+                .build());
+        changeTaskStatus(run, task, TaskStatus.SUPERSEDED, "plan rejected by " + rejectedBy + ": " + comment);
+
+        long replans = taskRepo.findByRunId(runId).stream()
+                .filter(t -> t.getStatus() == TaskStatus.SUPERSEDED)
+                .count();
+        if (replans > MAX_REPLANS) {
+            changeRunStatus(run, RunStatus.FAILED,
+                    "safe-stop: plan rejected " + replans + " times (limit " + MAX_REPLANS + " re-plans)");
+            return run;
+        }
+
+        changeRunStatus(run, RunStatus.RUNNING, "re-planning after review (" + replans + "/" + MAX_REPLANS + ")");
+        runDesign(run, requirementsSpec(runId), decisionsFor(runId));
         return run;
     }
 
@@ -165,9 +210,16 @@ public class OrchestrationEngine {
 
         switch (outcome.status()) {
             case COMPLETED -> {
-                changeTaskStatus(run, task, TaskStatus.COMPLETED,
-                        "plan validated: " + outcome.output().tasks().size() + " tasks");
-                runExecution(run, outcome.output());
+                if (run.requiresPlanReview()) {
+                    // gate: a person approves or rejects the plan before anything is executed
+                    changeTaskStatus(run, task, TaskStatus.AWAITING_HUMAN,
+                            "plan ready for review: " + outcome.output().tasks().size() + " tasks");
+                    changeRunStatus(run, RunStatus.AWAITING_HUMAN, "waiting for a person to review the plan");
+                } else {
+                    changeTaskStatus(run, task, TaskStatus.COMPLETED,
+                            "plan validated: " + outcome.output().tasks().size() + " tasks");
+                    runExecution(run, outcome.output());
+                }
             }
             default -> fail(run, task, "design failed: " + String.join("; ", outcome.errors()));
         }
@@ -232,6 +284,47 @@ public class OrchestrationEngine {
     }
 
     // ---------------------------------------------------------------- helpers
+
+    private OrchestrationRun approvePlan(OrchestrationRun run, TaskExecution task, String approvedBy, String decision) {
+        decisionRecordRepository.save(DecisionRecord.builder()
+                .run(run).task(task)
+                .question(PLAN_REVIEW_QUESTION)
+                .decision("Approved: " + decision)
+                .decidedBy(approvedBy)
+                .build());
+        changeTaskStatus(run, task, TaskStatus.COMPLETED, "plan approved by " + approvedBy + ": " + decision);
+        changeRunStatus(run, RunStatus.RUNNING, "executing the approved plan");
+        runExecution(run, objectMapper.readValue(task.getOutputJson(), DesignSpec.class));
+        return run;
+    }
+
+    /** Guard: only a run that is waiting for a person can be approved or rejected (else 409). */
+    private OrchestrationRun waitingRun(UUID runId) {
+        OrchestrationRun run = runRepo.findById(runId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "No run " + runId));
+        if (run.getStatus() != RunStatus.AWAITING_HUMAN) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "Run is " + run.getStatus() + ", not awaiting a human");
+        }
+        return run;
+    }
+
+    private TaskExecution waitingTask(UUID runId) {
+        return taskRepo.findByRunId(runId).stream()
+                .filter(t -> t.getStatus() == TaskStatus.AWAITING_HUMAN)
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "Run " + runId + " is AWAITING_HUMAN but has no task awaiting a human"));
+    }
+
+    /** The validated spec stored by the requirements stage — re-planning never calls requirements again. */
+    private RequirementSpec requirementsSpec(UUID runId) {
+        TaskExecution requirements = taskRepo.findByRunId(runId).stream()
+                .filter(t -> REQUIREMENTS.equals(t.getTaskType()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("Run " + runId + " has no requirements task"));
+        return objectMapper.readValue(requirements.getOutputJson(), RequirementSpec.class);
+    }
 
     /** Write state first: the task is PENDING, then RUNNING, before its agent is called. */
     private TaskExecution startTask(OrchestrationRun run, String taskType, String reason) {
