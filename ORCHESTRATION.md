@@ -194,21 +194,23 @@ rejecting while the run waits on a requirements question (not a plan) is also a 
 | `orchestration.agent.requirements` | `RequirementsAgent`, `RequirementSpec`, `Ambiguity`, `RequirementSpecValidator`, `StubRequirementsAgent` | Turn a raw request into intent, functional requirements and ambiguities rated LOW / MEDIUM / HIGH |
 | `orchestration.agent.design` | `DesignAgent`, `DesignSpec`, `PlannedTask`, `HumanDecision`, `DesignSpecValidator`, `StubDesignAgent`, `ClaudeDesignAgent` | Turn the spec + human decisions into a task DAG (`dependsOn`) |
 | `orchestration.step` | `RequirementsStep`, `DesignStep`, `StepOutcome`, `StepStatus` | Evaluator-optimizer loop: call agent → validate → feed errors back → bounded retry |
-| `orchestration.execution` | `DagScheduler`, `ExecutionStep`, `TaskExecutor`, `StubTaskExecutor`, `TaskResult`, `ExecutionOutcome` | Groups the plan into waves; runs each wave in parallel on virtual threads; stops safely on failure |
+| `orchestration.execution` | `DagScheduler`, `ExecutionStep`, `TaskExecutor`, `StubTaskExecutor`, `ClaudeTaskExecutor`, `ProposedChange`, `TaskResult`, `ExecutionOutcome` | Groups the plan into waves; runs each wave in parallel on virtual threads; stops safely on failure. With Claude, each task returns a proposed change (files + summary + diff) for human review |
+| `orchestration.agent` | `ClaudeAnswers`, `ValidationResult`, `Impact` | Shared: thinking-safe model call + mapping used by all Claude classes |
 | `orchestration.engine` | `OrchestrationEngine`, `RunView`, `ReliabilityMetricsService` | Runs stages in order, maps outcomes to state, handles approval, resume, safe-stop and rollback; computes reliability metrics |
 | `orchestration.run` | `OrchestrationRun`, `TaskExecution`, `StateTransition`, `DecisionRecord` + repositories | Persistent state, append-only audit trail, decision lineage |
 | `orchestration.api` | `RunController` | `POST /runs`, `GET /runs/{id}`, `POST /runs/{id}/approve`, `POST /runs/{id}/reject`, `GET /runs/metrics` |
 
 Agents are **interfaces**. The stubs are the default implementation, so tests and demos
-are deterministic and cost nothing. `ClaudeRequirementsAgent` and `ClaudeDesignAgent`
-(Spring AI `ChatClient`, structured output into `RequirementSpec` / `DesignSpec`) plug in
-behind the same interfaces without touching the engine, steps or validators.
+are deterministic and cost nothing. `ClaudeRequirementsAgent`, `ClaudeDesignAgent` and
+`ClaudeTaskExecutor` (Spring AI `ChatClient`, answers mapped into `RequirementSpec`,
+`DesignSpec` and `ProposedChange`) plug in behind the same interfaces without touching the
+engine, steps or validators.
 
 ### Switching to the real model
 
 ```yaml
 orchestration.agents.mode: stub     # default: free, deterministic, used by all tests
-orchestration.agents.mode: claude   # requirements and design call Claude; execution stays stubbed
+orchestration.agents.mode: claude   # requirements, design and execution call Claude
 ```
 
 Exactly one bean per agent interface exists at a time (`@ConditionalOnProperty`, with
@@ -221,6 +223,12 @@ The design agent's prompt carries a short map of this codebase (controllers, ser
 repositories, entities) so plans name real classes, the same DAG rules the validator
 enforces, and the human decisions as **fixed constraints** — including review comments,
 which is how a rejected plan is redesigned.
+
+The executor sends one planned task and gets back a `ProposedChange` (files, summary, diff).
+It is checked in code (at least one file, a non-empty diff), stored on the task for a person
+to review, and **never applied to the repository**. Tasks in the same wave call the model in
+parallel, so every call goes through `AgentConcurrencyLimiter` (bounded in-flight calls, with
+a timeout).
 
 The model's answer is **not trusted**: it goes through the same validator as the stub's,
 and on a retry the validator's errors are appended to the prompt
@@ -242,7 +250,7 @@ and on a retry the validator's errors are appended to the prompt
 | **Audit trail** | `StateTransition`: every status change of the run and each task, with a reason, append-only. |
 | **Decision lineage** | `DecisionRecord`: question, answer, who, when — stored as data and passed to later stages. |
 | **Statefulness** | All state in Postgres. A waiting run survives restarts; resuming reads the stored spec instead of calling the model again. |
-| **Policy guardrails** | Implemented in code, not prompts: validators, max task count, bounded attempts, approval only from `AWAITING_HUMAN`, and change control — a schema change is a HIGH-impact action that needs a person's approval (brownfield scenario). Concurrency limits for model calls: `AgentConcurrencyLimiter` (built, see limitations). |
+| **Policy guardrails** | Implemented in code, not prompts: validators, max task count, bounded attempts, approval only from `AWAITING_HUMAN`, and change control — a schema change is a HIGH-impact action that needs a person's approval (brownfield scenario). Concurrency limits for parallel model calls: `AgentConcurrencyLimiter` around every executor call. |
 | **Reliability metrics** | Success rate, retry rate, rollback frequency, MTTR and end-to-end latency at `GET /api/v1/runs/metrics` (computed from stored runs), plus live Micrometer meters at `/actuator/prometheus`. See section 6. |
 | **Observability** | Actuator + Prometheus endpoint; per-run detail via `GET /runs/{id}` (attempts, errors, outputs, trail, decisions). |
 | **Three scenarios** | Greenfield, brownfield and ambiguous, each end to end in `ScenarioTest`. See section 5. |
@@ -351,9 +359,20 @@ retry prompt. Precise feedback means fewer retries and lower cost.
 
 ## 8. Known limitations (deliberate, for scope)
 
-- **First real call failed on response mapping** (empty content). The pipeline handled it
-  as designed — the step returned `FAILED` with the error, no retry, no crash — and a
-  raw-response diagnostic test located the issue before changing anything.
+- **Real model calls first failed with "No content to map".** Root cause, found by printing
+  the raw response instead of guessing: the model returns a *thinking* part before its
+  answer, and `.entity()` read only the first part (no text); with `max-tokens: 2048` the
+  thinking also used the whole budget (`finishReason: max_tokens`, 2048 completion tokens,
+  zero text). Ruled out one change at a time: the native structured-output flag was not the
+  cause; disabling thinking is rejected by this model (HTTP 400). Fix: `ClaudeAnswers` reads
+  the last part that contains text and converts it, and `max-tokens` leaves room for thinking
+  plus the answer. Every failure along the way was handled safely — the step or task
+  returned `FAILED` with the reason, never a crash.
+- **Output shape is requested through the prompt, not enforced by the provider.** Reading
+  the answer part ourselves means using `.chatResponse()` rather than `.entity()`, so
+  provider-native structured output is not used. The validators and code checks enforce
+  the content; `validateSchema()` is deliberately not used because the steps already retry
+  with validator feedback (no stacked retries).
 - **One DB transaction spans the agent call.** Instant with stubs; with a real model
   (seconds) the work should be split so no connection is held while waiting —
   e.g. commit `RUNNING`, call the model outside a transaction, commit the result.
@@ -364,12 +383,13 @@ retry prompt. Precise feedback means fewer retries and lower cost.
 - **Kahn reports blocked tasks, not only the exact cycle.** A task downstream of a
   cycle is listed too. Good enough as retry feedback for ≤ 10 tasks; a DFS would
   isolate the cycle precisely.
-- **`AgentConcurrencyLimiter` is built but not yet wired into the steps.** It matters
-  once real model calls run in parallel; with stubs there is nothing to limit.
-- **Execution is simulated.** `StubTaskExecutor` returns a result shaped like real work;
-  the orchestration around it (waves, threads, barrier, safe-stop, rollback, audit) is real.
-  A model-backed executor would propose a diff on a branch and use the test suite as its
-  validator. Likewise `ROLLED_BACK` is a recorded state; real rollback would revert that branch.
+- **Execution proposes, it does not apply.** By default `StubTaskExecutor` simulates the
+  work; in `claude` mode each task gets a real proposed change (files + diff), stored for
+  review. Nothing is written to the repository, so `ROLLED_BACK` is a recorded state; applying
+  proposals on a branch with the test suite as the validator is the next step.
+- **The concurrency limiter uses one bucket for execution calls.** The `TaskExecutor`
+  contract carries no run id, so the per-run cap applies across all runs' execution calls.
+  Passing the run id through would restore per-run fairness.
 - **Waves, not fully dependency-driven scheduling.** A fast task can't start its own
   dependents until its whole wave is done. Simpler and enough for ≤ 10 tasks; a per-task
   scheduler would remove that wait.
@@ -388,8 +408,8 @@ retry prompt. Precise feedback means fewer retries and lower cost.
 
 1. Policy-driven plan review: require it automatically for high-impact plans.
 2. Re-planning from any stage, including requirements when the request itself changes.
-3. A model-backed `TaskExecutor`: propose a diff per task on a branch, validate with the
-   test suite, and wire `AgentConcurrencyLimiter` around the parallel model calls.
+3. Apply proposed changes on a branch and use the test suite as the executor's validator
+   (failures go back as feedback, bounded retries — the same loop as the other stages).
 4. Re-planning: if design fails twice, or upstream outputs change, return to the earlier
    stage with the errors or the new input.
 5. Per-run failure policy: fail-fast (today) or fail-at-end for independent tasks.
@@ -400,12 +420,14 @@ retry prompt. Precise feedback means fewer retries and lower cost.
 ## 10. Tests
 
 ```bash
-mvn clean test      # ~101 tests, no API key, no network calls to a model
+mvn clean test      # ~107 tests, no API key, no network calls to a model
 ```
 
-- Real model: `ClaudeRequirementsAgentIT` and `ClaudeDesignAgentIT` run only when
-  `ANTHROPIC_API_KEY` is set. (Prompt-building is unit-tested for free in
-  `ClaudeRequirementsAgentTest` and `ClaudeDesignAgentTest`.)
+- Real model: `ClaudeRequirementsAgentIT`, `ClaudeDesignAgentIT` and
+  `ClaudeTaskExecutorIT` run only when `ANTHROPIC_API_KEY` is set, one call each, and assert
+  the contract (the output passes our checks), not the wording. Prompt-building and the
+  executor's checks are unit-tested for free (`Claude*Test`). Raw-response diagnostics
+  (`*RawIT`) are `@Disabled` by default.
   It makes one call and asserts the **contract**, not the wording: the spec passes the
   validator and the vague request is flagged with a HIGH ambiguity.
   `ClaudeRawResponseIT` (disabled by default) prints the raw response for debugging.

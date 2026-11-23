@@ -212,8 +212,8 @@ Full walkthrough in [ORCHESTRATION.md](ORCHESTRATION.md).
 - [x] Execution stage: parallel waves on virtual threads, synchronization, safe-stop and rollback
 - [x] Three scenarios: greenfield, brownfield (schema change approval), ambiguous
 - [x] Reliability metrics: success rate, retry and rollback frequency, MTTR, latency
-- [x] Claude requirements and design agents (Spring AI) behind a config switch; stubs stay default
+- [x] Claude requirements and design agents and task executor (Spring AI) behind a config switch; stubs stay default
 - [x] Plan review gate after design, with bounded re-planning on rejection
-- [ ] Model-backed task executor
+- [ ] Apply proposed changes on a branch, with the test suite as the executor's validator
 
 See also: [ENGINEERING_JUDGEMENT.md](ENGINEERING_JUDGEMENT.md) · [UPGRADE.md](UPGRADE.md) · [DOCKER.md](DOCKER.md)
