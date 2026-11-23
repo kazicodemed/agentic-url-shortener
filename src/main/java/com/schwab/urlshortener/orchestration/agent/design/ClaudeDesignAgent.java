@@ -1,6 +1,7 @@
 package com.schwab.urlshortener.orchestration.agent.design;
 
 import com.schwab.urlshortener.orchestration.agent.requirements.RequirementSpec;
+import com.schwab.urlshortener.orchestration.agent.ClaudeAnswers;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -24,7 +25,8 @@ public class ClaudeDesignAgent implements DesignAgent {
 
     static final String SYSTEM = """
             You are a software architect for a URL shortener service: Java 21, Spring Boot,
-            PostgreSQL, Redis. Key modules:
+            PostgreSQL, Redis. Code lives under src/main/java/com/schwab/urlshortener/
+            (packages: controller, service, repository, entity, dto). Key modules:
             - UrlShortenerController (POST /api/v1/shorten, GET /api/v1/analytics/{code}), RedirectController (GET /{code})
             - UrlShortenerService (shortenUrl, validateCustomCode, saveWithRetry), ShortCodeGenerator, AnalyticsRecorder
             - UrlMappingRepository, AnalyticsEventRepository; entities UrlMapping (table url_mappings), AnalyticsEvent
@@ -52,10 +54,8 @@ public class ClaudeDesignAgent implements DesignAgent {
 
     @Override
     public DesignSpec design(RequirementSpec requirements, List<HumanDecision> decisions, List<String> feedback) {
-        return chatClient.prompt()
-                .user(userText(objectMapper.writeValueAsString(requirements), decisions, feedback))
-                .call()
-                .entity(DesignSpec.class);
+        return ClaudeAnswers.ask(chatClient,
+                userText(objectMapper.writeValueAsString(requirements), decisions, feedback), DesignSpec.class);
     }
 
     /** The user message: the spec, the human decisions, and the validator's errors on a retry. */

@@ -1,9 +1,11 @@
 package com.schwab.urlshortener.orchestration.execution;
 
 import com.schwab.urlshortener.orchestration.agent.design.PlannedTask;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 @Component
+@ConditionalOnProperty(name = "orchestration.agents.mode", havingValue = "stub", matchIfMissing = true)
 public class StubTaskExecutor implements TaskExecutor {          // ← add "implements TaskExecutor"
 
     static final long WORK_MILLIS = 200;

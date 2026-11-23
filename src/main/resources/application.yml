@@ -44,7 +44,9 @@ spring:
       chat:
         options:
           model: claude-sonnet-5-5     # stronger model for the demo; no extended thinking
-          max-tokens: 2048             # hard cap on cost per call
+          # hard cap on cost per call; must leave room for the model's thinking AND the answer:
+          # at 2048 the model used the whole budget thinking (finishReason max_tokens, no text)
+          max-tokens: 8192
 
 server:
   port: 8080
@@ -64,7 +66,7 @@ url-shortener:
 # Orchestration guardrails
 orchestration:
   # Which agent implementations run. stub = free and deterministic (default, used by tests).
-  # claude = real model calls for requirements and design; needs ANTHROPIC_API_KEY. Execution stays stubbed.
+  # claude = real model calls for requirements, design and execution; needs ANTHROPIC_API_KEY.
   agents:
     mode: ${ORCHESTRATION_AGENTS_MODE:stub}
   agent:

@@ -1,5 +1,6 @@
 package com.schwab.urlshortener.orchestration.agent.requirements;
 
+import com.schwab.urlshortener.orchestration.agent.ClaudeAnswers;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -47,10 +48,7 @@ public class ClaudeRequirementsAgent implements RequirementsAgent {
 
     @Override
     public RequirementSpec analyze(String rawRequirement, List<String> feedback) {
-        return chatClient.prompt()
-                .user(userText(rawRequirement, feedback))
-                .call()
-                .entity(RequirementSpec.class);
+        return ClaudeAnswers.ask(chatClient, userText(rawRequirement, feedback), RequirementSpec.class);
     }
 
     /** The user message: the request, plus the validator's errors on a retry. */
